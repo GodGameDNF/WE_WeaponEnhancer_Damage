@@ -4,171 +4,184 @@
 using namespace RE;
 
 PlayerCharacter* p = nullptr;
-BGSProjectile* TestProj = nullptr;
-TESForm* tempForm = nullptr;
-BSScript::IVirtualMachine* vmSave = nullptr;
-TESDataHandler* dataHandler = nullptr;
+BSScript::IVirtualMachine* vm = nullptr;
+TESDataHandler* DH = nullptr;
 
+EnchantmentItem* enhanceDamageENCH = nullptr;
 ActorValueInfo* damageMultAV = nullptr;
-ActorValueInfo* damageResistAV = nullptr;
-ActorValueInfo* energyResistAV = nullptr;
+ActorValueInfo* weaponTypeAV = nullptr;
+ActorValueInfo* addonStrongMultAV = nullptr;
+EffectSetting* enhanceDamageEffect = nullptr;
+SpellItem* enhanceDamageSpell = nullptr;
 
-template <class Ty>
-Ty SafeWrite64Function(uintptr_t addr, Ty data)
+
+float CalculateAttackDamage(TESObjectWEAP::InstanceData* instData, TESAmmo* tAmmo)
 {
-	DWORD oldProtect;
-	void* _d[2];
-	memcpy(_d, &data, sizeof(data));
-	size_t len = sizeof(_d[0]);
-
-	VirtualProtect((void*)addr, len, PAGE_EXECUTE_READWRITE, &oldProtect);
-	Ty olddata;
-	memset(&olddata, 0, sizeof(Ty));
-	memcpy(&olddata, (void*)addr, len);
-	memcpy((void*)addr, &_d[0], len);
-	VirtualProtect((void*)addr, len, oldProtect, &oldProtect);
-	return olddata;
+	using func_t = decltype(&CalculateAttackDamage);
+	REL::Relocation<func_t> func{ REL::ID(579254) };
+	return func(instData, tAmmo);
 }
 
-bool DoDamage(Actor* victim, float damage, Actor* attacker)
+float getPlayerWeaponDamage()
 {
-	using func_t = decltype(&DoDamage);
-	REL::Relocation<func_t> func{ REL::ID(1539010) };
-	return func(victim, damage, attacker);
-}
+	float fDamage = 0;
 
-class ProjectileHooks : public Projectile
-{
-public:
-	typedef bool (ProjectileHooks::*FnProcessImpacts)();
+	BSTArray<EquippedItem>* equipped = &p->currentProcess->middleHigh->equippedItems;
 
-	bool tempProcessImpacts()
-	{
-		{
-			
-			for (auto it = this->impacts.begin(); it != this->impacts.end(); ++it) {
-				if (it->processed || !it->collidee.get() || it->collidee.get()->GetFormType() != ENUM_FORM_ID::kACHR || !it->colObj.get())
-					continue;	// 실드 프레임워크 카짓한 조건문
+	if (!equipped) {
+		logger::info("장착 장비 배열을 구하지 못함");
+		return fDamage;
+	}
 
-				Actor* a = (Actor*)it->collidee.get().get();
-				TESObjectREFR* owner = this->shooter.get().get();
+	if (equipped->size() != 0 && (*equipped)[0].item.instanceData) {
+		TESObjectWEAP* weap = (TESObjectWEAP*)(*equipped)[0].item.object;
 
-				if (owner && owner->formType == ENUM_FORM_ID::kACHR) {	// 총알이 사람한테서 발사됐나 확인
-					float dMult = owner->GetActorValue(*damageMultAV);
-					if (dMult > 0) { // 모드로 강화된 무기인지 확인
-						BGSObjectInstanceT<TESObjectWEAP> sWeapon = this->weaponSource;
-						TESObjectWEAP::InstanceData* sWeapData = (TESObjectWEAP::InstanceData*)sWeapon.instanceData.get();
-						if (sWeapData) {	// 수류탄등이 아니라 총에서 발사된 투사체인지 확인
-							if (this->damage > 0) {  // 에너지 무기는 기본 데미지가 0으로 설정되어있음
-								float DR = a->GetActorValue(*damageResistAV);
-								if (DR <= 0)
-									DR = 0.1;
+		if (!weap) {
+			logger::info("장착 무기를 못구함");
+			return fDamage;
+		}
 
-								float damageCalculation = pow(this->damage / DR, 0.366) * 0.5;
-								float damagePoint;
+		
 
-								if (damageCalculation < 0.99) {
-									damagePoint = damageCalculation;
-								} else {
-									damagePoint = 0.99;
-								}
+		TESObjectWEAP::InstanceData* instData = (TESObjectWEAP::InstanceData*)((*equipped)[0].item.instanceData).get();	
+		BGSObjectInstanceT<TESObjectWEAP>* weaponInstance = new BGSObjectInstanceT<TESObjectWEAP>(weap, instData);
 
-								int numProj = sWeapData->rangedData->numProjectiles;	// 팰릿의 수를 구함
-								if (numProj < 1)
-									numProj = 1;
+		bool bTempDamage1 = false;
 
-								damagePoint = damagePoint * this->damage * dMult / numProj / 100;
-								DoDamage(a, damagePoint, (Actor*)owner);
+		// 물리 데미지 0인 무기 배율 계산을 위해 잠시 더함. 다른 방법 찾으면 변경
+		uint32_t fBaseDamage = instData->attackDamage;
+		if (fBaseDamage < 1) {
+			instData->attackDamage = 1;
+			bTempDamage1 = true;
+			fBaseDamage = 1;
+		}
 
-								//logger::info("기본피해 {} 추가피해 {} 팰릿수 {}", this->damage, damagePoint, numProj);
-							} else {
-								if (sWeapData) {
-									BSTArray<BSTTuple<TESForm*, BGSTypedFormValuePair::SharedVal>>* tempTypes = sWeapData->damageTypes;
-									if (tempTypes) {
-										int i = tempTypes->size();
-										if (i > 0) {
-											int iDamage = 0;
-											for (auto& tuple : *tempTypes) {
-												iDamage += tuple.second.i;
-											}	// weapon의 에너지 피해타입을 찾아 피해량을 합산함
+		//logger::info("혹시 무기 데미지 기본 말고 잘뽑히나 확인 {}", weap->weaponData.attackDamage);
+		float fDisplayDamage = CombatFormulas::GetWeaponDisplayDamage(*weaponInstance, instData->ammo, 1);
 
-											float ER = a->GetActorValue(*energyResistAV);
-											if (ER <= 0)
-												ER = 0.1;
-
-											float damageCalculation = pow(iDamage / ER, 0.366) * 0.5;
-											float damagePoint;
-
-											if (damageCalculation < 0.99) {
-												damagePoint = damageCalculation;
-											} else {
-												damagePoint = 0.99;
-											}
-
-											int numProj = sWeapData->rangedData->numProjectiles;
-											if (numProj < 1)
-												numProj = 1;
-
-											damagePoint = damagePoint * iDamage * dMult / numProj / 100;
-											DoDamage(a, damagePoint, (Actor*)owner);
-
-											//logger::info("기본피해 {} 추가피해 {}", iDamage, damagePoint);
-										}
-									}
-								}
-							}
-						}
-					}
+		// 추가된 피해량은 DamageTypeValue는 계산되지 않기 때문에 있다면 합한다음 배율을 구해 곱하기
+		uint32_t iTotalTypeDamage = 0;
+		BSTArray<BSTTuple<TESForm*, BGSTypedFormValuePair::SharedVal>>* damageTypeList = instData->damageTypes;
+		if (damageTypeList) {
+			uint32_t iSize = damageTypeList->size();
+			if (iSize > 0) {
+				uint32_t iTempTotalDamage = 0;
+				for (int i = 0; i < iSize; ++i) {
+					auto& tuple = (*damageTypeList)[i];
+					// 두 번째 요소 (BGSTypedFormValuePair::SharedVal) 접근
+					BGSTypedFormValuePair::SharedVal value = tuple.second;
+					iTempTotalDamage += value.i;
 				}
+				// 합한 데미지타입 피해에 배율을 구해서 곱함
+				float fDamageTypeMult = (fDisplayDamage - fBaseDamage) / fBaseDamage;
+				fDamageTypeMult = fDamageTypeMult > 0 ? fDamageTypeMult + 1 : 1;
+				iTotalTypeDamage = iTempTotalDamage * fDamageTypeMult;
+
+				
 			}
 		}
-		FnProcessImpacts fn = fnHash.at(*(uintptr_t*)this);
-		return fn ? (this->*fn)() : false;
+		
+
+		int8_t numProj = instData->rangedData->numProjectiles; // 팰릿수를 구함
+
+		// 펠릿 수에 따른 배수 계산 
+		float fNumProjMult;
+		if (numProj <= 1) {
+			fNumProjMult = 1;
+			p->SetActorValue(*weaponTypeAV, 0);
+		} else {
+			fNumProjMult = numProj * 0.8; // 팰릿이 많으면 방어력에서 손해를 보니 딜을 조금 세게함
+			p->SetActorValue(*weaponTypeAV, 1); // 팰릿이 많으면 샷건으로 취급
+		}
+
+		float fStrongMult = p->GetActorValue(*addonStrongMultAV) / 100; // "강력" 애드온 배율 계산
+
+		fDamage = (fDisplayDamage + iTotalTypeDamage) / fNumProjMult * fStrongMult;
+		
+		//logger::info("디스플레이 물리 피해량 {} 다른 피해 보정값 {}", fDisplayDamage, iTotalTypeDamage);
+
+		// 계산을 위해 임시로 1 데미지를 부여했다면 다시 0으로 되돌림
+		if (bTempDamage1) {
+			instData->attackDamage = 0;
+		}
 	}
 
-	static void HookProcessImpacts(uintptr_t addr, uintptr_t offset)
-	{
-		FnProcessImpacts fn = SafeWrite64Function(addr + offset, &ProjectileHooks::tempProcessImpacts);
-		fnHash.insert(std::pair<uintptr_t, FnProcessImpacts>(addr, fn));
-	}
-
-protected:
-	static std::unordered_map<uintptr_t, FnProcessImpacts> fnHash;
-};
-std::unordered_map<uintptr_t, ProjectileHooks::FnProcessImpacts> ProjectileHooks::fnHash;
-
-void RegisterEvent()
-{
-	p = PlayerCharacter::GetSingleton();
-	dataHandler = RE::TESDataHandler::GetSingleton();
-	if (!dataHandler)
-		return;
-
-	damageMultAV = (ActorValueInfo*)dataHandler->LookupForm(0xA6F, "WE_WeaponEnhancer.esp");
-	damageResistAV = (ActorValueInfo*)dataHandler->LookupForm(0x2E3, "Fallout4.esm");
-	energyResistAV = (ActorValueInfo*)dataHandler->LookupForm(0x2EB, "Fallout4.esm");
-
-	uint64_t addr;
-	uint64_t offset = 0x680;
-	addr = Projectile::VTABLE[0].address();
-	ProjectileHooks::HookProcessImpacts(addr, offset);
-
-	addr = MissileProjectile::VTABLE[0].address();
-	ProjectileHooks::HookProcessImpacts(addr, offset);
-
-	addr = BeamProjectile::VTABLE[0].address();
-	ProjectileHooks::HookProcessImpacts(addr, offset);
-
-	addr = FlameProjectile::VTABLE[0].address();
-	ProjectileHooks::HookProcessImpacts(addr, offset);
+	return fDamage;
 }
+
+void setEnhanceDamage(std::monostate) {
+	float fDamage = getPlayerWeaponDamage();
+
+	BSTArray<EffectItem*> effectList = enhanceDamageSpell->listOfEffects;
+	if (effectList.empty()) {
+		logger::info("스펠의 이펙트 리스트가 비었음");
+		return;
+	}
+
+	for (EffectItem* effect : effectList) {
+		if (!effect) {
+			logger::info("이펙을 지정했지만 못잡았음");
+			continue;
+		}
+
+		EffectSetting* targetEffect = effect->effectSetting;
+
+		if (targetEffect && targetEffect == enhanceDamageEffect) {
+			float dMult = p->GetActorValue(*damageMultAV);
+
+			float fPercentAV = 80; //추가 데미지 형식이라 방어력에 막히니 100으로 나누지 않고 약간 더 세게함
+			
+			float fSetDamage = fDamage * dMult / fPercentAV;
+			effect->data.magnitude = fSetDamage;
+		}
+	}
+}
+
 
 void OnF4SEMessage(F4SE::MessagingInterface::Message* msg)
 {
 	switch (msg->type) {
 	case F4SE::MessagingInterface::kGameLoaded:
 		//kPostLoadGame:  //kGameDataReady: //  //kGameLoaded:
-		RegisterEvent();
+		DH = TESDataHandler::GetSingleton();
+
+		//enhanceDamageENCH = (EnchantmentItem*)DH->LookupForm(0x0ACA, "WE_WeaponEnhancer.esp");
+		enhanceDamageSpell = (SpellItem*)DH->LookupForm(0x0AD2, "WE_WeaponEnhancer.esp");
+		damageMultAV = (ActorValueInfo*)DH->LookupForm(0x0ACE, "WE_WeaponEnhancer.esp");
+		weaponTypeAV = (ActorValueInfo*)DH->LookupForm(0x0AB3, "WE_WeaponEnhancer.esp");
+		addonStrongMultAV = (ActorValueInfo*)DH->LookupForm(0x0AD4, "WE_WeaponEnhancer.esp");
+		enhanceDamageEffect = (EffectSetting*)DH->LookupForm(0xACF, "WE_WeaponEnhancer.esp");
+		p = PlayerCharacter::GetSingleton();
+
+		if (!p) {
+			logger::info("플레이어 못잡음");
+			return;
+		}
+
+		if (!enhanceDamageSpell) {
+			logger::info("스펠 못잡음");
+			return;
+		}
+
+		if (!damageMultAV) {
+			logger::info("엑터밸류 못잡음");
+			return;
+		}
+
+		if (!enhanceDamageEffect) {
+			logger::info("매직이펙트 못잡음");
+			return;
+		}
+
+		break;
+
+	case F4SE::MessagingInterface::kPostLoadGame:
+		if (!p) {
+			logger::info("플레이어 못잡음");
+			return;
+		}
+
+		setEnhanceDamage(std::monostate{});
 		break;
 	}
 }
@@ -176,13 +189,11 @@ void OnF4SEMessage(F4SE::MessagingInterface::Message* msg)
 bool RegisterPapyrusFunctions(RE::BSScript::IVirtualMachine* a_vm)
 {
 	REL::IDDatabase::Offset2ID o2i;
-	logger::info("0x0x0d79eb0: {}", o2i(0x0d79eb0));
+	logger::info("0x0x02FBB50 : {}", o2i(0x02FBB50));
 
-	std::size_t offset = REL::IDDatabase::get().id2offset(1010112);
-	logger::info("Offset for ID 1010112: {}", offset);
+	a_vm->BindNativeMethod("WE_WeaponEnhancer_Damage"sv, "setEnhanceDamage"sv, setEnhanceDamage);
 
-	//a_vm->BindNativeMethod("Lootjunk_F4SE"sv, "SearchAllForms"sv, SearchAllForms);
-	vmSave = a_vm;
+	vm = a_vm;
 	return true;
 }
 
